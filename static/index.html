@@ -83,6 +83,7 @@ const SECTIONS = [
 ];
 let rows = [];          // 表示順の行
 let selId = null;       // 選択中の行 id（更新しても id で追う）
+let missing = 0;        // 選択中の行が一覧に無かった連続回数
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -125,7 +126,9 @@ function render(data) {
     "更新 " + new Date(data.now * 1000).toLocaleTimeString("ja-JP", {hour12: false});
 
   rows = data.rows;
-  if (!rows.some(r => r.id === selId)) selId = rows.length ? rows[0].id : null;
+  // 選択中のエージェントが消えても 2 回の更新までは選択を保つ（一時的な欠けで先頭に飛ばないように）
+  if (rows.some(r => r.id === selId)) missing = 0;
+  else if (rows.length && (selId === null || ++missing > 2)) { selId = rows[0].id; missing = 0; }
 
   for (const [key, label] of SECTIONS) {
     const list = rows.filter(r => r.section === key);

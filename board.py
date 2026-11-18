@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """herdr-board: Herdr のエージェントを状態ごとに一覧する web UI。
 
-  python3 board.py [--port 7788] [--no-pr]
+  python3 board.py [--port 7788] [--no-pr]   # ブラウザ版
+  python3 board.py --tui [--no-pr]            # 端末版（サーバーは立てない）
 
-127.0.0.1 にだけ bind する。ブラウザで http://127.0.0.1:7788/ を開く。
+ブラウザ版は 127.0.0.1 にだけ bind する。ブラウザで http://127.0.0.1:7788/ を開く。
 """
 import argparse
 import json
@@ -338,8 +339,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Herdr のエージェントを状態ごとに一覧する web UI")
     ap.add_argument("--port", type=int, default=7788)
     ap.add_argument("--no-pr", action="store_true", help="gh で PR を調べない")
+    ap.add_argument("--tui", action="store_true", help="端末に表示する（サーバーは立てない）")
+    ap.add_argument("--interval", type=float, default=3.0, help="端末版の更新間隔（秒）")
     args = ap.parse_args(argv)
     board = Board(pr_enabled=not args.no_pr)
+    if args.tui:
+        import tui
+        return tui.run(board, max(0.5, args.interval))
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(board, args.port))
     print(f"herdr-board: http://127.0.0.1:{args.port}/", file=sys.stderr)
     try:
@@ -349,4 +355,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
