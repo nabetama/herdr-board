@@ -86,6 +86,16 @@ _TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 _TASK_STATUS_RE = re.compile(r"<status>([^<]+)</status>")
 
 
+def _last_pr_url(text):
+    urls = PR_URL_RE.findall(text or "")
+    return urls[-1] if urls else None
+
+
+def _is_gh_pr_command(name, inp):
+    cmd = (inp or {}).get("command") if isinstance(inp, dict) else None
+    return name == "Bash" and isinstance(cmd, str) and re.search(r"\bgh\s+pr\s", cmd) is not None
+
+
 def summarize_lines(lines):
     """会話ログの行（文字列）のリストを要約する。末尾だけを渡す前提で、途中から始まっても壊れない。"""
     s = {
@@ -97,9 +107,10 @@ def summarize_lines(lines):
         "bg_tasks": {},        # 動いているバックグラウンドタスク id -> 種類
         "git_branch": None,
         "custom_title": None,
-        "pr_url": None,       # 会話ログに最後に出た PR の URL
+        "pr_url": None,       # 関係する PR の URL（_pr_urls_from の説明を参照）
     }
     pending = {}  # tool_use_id -> {"name", "desc"}
+    gh_pr_tools = set()  # `gh pr ...` を実行した tool_use の id
     tool_names = {}
     for line in lines:
         try:
@@ -108,10 +119,6 @@ def summarize_lines(lines):
             continue
         if not isinstance(e, dict):
             continue
-        if "/pull/" in line:
-            urls = PR_URL_RE.findall(line)
-            if urls:
-                s["pr_url"] = urls[-1]
         t = e.get("type")
         ts = _parse_ts(e.get("timestamp"))
         if ts:
@@ -130,15 +137,19 @@ def summarize_lines(lines):
                     continue
                 if c.get("type") == "text" and c.get("text", "").strip():
                     s["last_assistant"] = c["text"]
+                    s["pr_url"] = _last_pr_url(c["text"]) or s["pr_url"]
                     s["last_assistant_ts"] = ts
                 elif c.get("type") == "tool_use":
                     desc = _tool_desc(c.get("name"), c.get("input"))
                     s["last_tool"] = f"{c.get('name')}: {desc}" if desc else c.get("name")
                     pending[c.get("id")] = {"name": c.get("name"), "desc": desc}
                     tool_names[c.get("id")] = c.get("name")
+                    if _is_gh_pr_command(c.get("name"), c.get("input")):
+                        gh_pr_tools.add(c.get("id"))
         elif t == "user":
             if is_human_prompt(e):
                 s["last_user"] = _text_of(content)
+                s["pr_url"] = _last_pr_url(s["last_user"]) or s["pr_url"]
                 s["last_user_ts"] = ts
                 continue
             # タスク完了の通知（文字列か text ブロック）
@@ -152,6 +163,9 @@ def summarize_lines(lines):
                 if isinstance(c, dict) and c.get("type") == "tool_result":
                     tid = c.get("tool_use_id")
                     pending.pop(tid, None)
+                    if tid in gh_pr_tools:
+                        rc = c.get("content")
+                        s["pr_url"] = _last_pr_url(rc if isinstance(rc, str) else _text_of(rc)) or s["pr_url"]
                     r = e.get("toolUseResult")
                     if isinstance(r, dict):
                         bg = r.get("backgroundTaskId") or (r.get("taskId") if r.get("status") in ("async_launched", "running") else None)
@@ -337,3 +351,26 @@ def ci_state(rollup):
 def project_dir_name(cwd):
     """Claude Code が会話ログを置くディレクトリ名（cwd の / と . を - にしたもの）。"""
     return re.sub(r"[/.]", "-", cwd or "")
+
+
+def overlay_task(row, entry, needs_you):
+    """作業の一覧表（--tasks）の進行中の行を、一覧の 1 行に重ねる。row を書き換えて返す。
+
+    - タイトルを表の「依頼内容」にする
+    - 補足は、会話ログ由来の「何を求めているか」（NEEDS YOU の ask）があればそれを残し、なければ表の「結果・メモ」にする
+    - needs_you（表の「状態」が確認待ちなど）なら NEEDS YOU に入れる。理由は「表: <状態>」。
+      会話ログからすでに NEEDS YOU と判定されていれば、そちらの理由と求めていることを残す
+    """
+    if not entry:
+        return row
+    status = short(entry.get("status"), 24)
+    if entry.get("task"):
+        row["title"] = short(entry["task"], 200)
+    has_ask = row.get("section") == NEEDS_YOU
+    if not has_ask and entry.get("note"):
+        row["sub"] = short(entry["note"], 200)
+    if needs_you and not has_ask:
+        row["section"] = NEEDS_YOU
+        row["reason"] = f"表: {status}"
+    row["task_status"] = status or None
+    return row

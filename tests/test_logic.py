@@ -76,10 +76,30 @@ class SummarizeTest(unittest.TestCase):
 
     def test_pr_url_and_branch(self):
         s = logic.summarize_lines([
-            j(type="user", gitBranch="fix/x", message={"content": "https://github.com/org/repo/pull/12 を作りました"}),
+            j(type="user", gitBranch="fix/x", origin={"kind": "human"},
+              message={"content": "https://github.com/org/repo/pull/12 を見て"}),
         ])
         self.assertEqual(s["pr_url"], "https://github.com/org/repo/pull/12")
         self.assertEqual(s["git_branch"], "fix/x")
+
+    def test_pr_url_sources(self):
+        url = "https://github.com/org/repo/pull/{}".format
+        s = logic.summarize_lines([
+            tool_use("t1", "Bash", {"command": "gh pr create --fill"}),
+            tool_result("t1", text=url(1) + "\n"),
+        ])
+        self.assertEqual(s["pr_url"], url(1))
+        s = logic.summarize_lines([assistant_text(f"PR を作りました: {url(2)}")])
+        self.assertEqual(s["pr_url"], url(2))
+        # ファイルを読んだ結果などに含まれる URL は拾わない
+        s = logic.summarize_lines([
+            assistant_text(f"PR を作りました: {url(3)}"),
+            tool_use("t2", "Bash", {"command": "cat notes.md"}),
+            tool_result("t2", text=f"| 他の仕事 | {url(4)} |"),
+            tool_use("t3", "Read", {"file_path": "/x.md"}),
+            tool_result("t3", text=url(5)),
+        ])
+        self.assertEqual(s["pr_url"], url(3))
 
     def test_custom_title(self):
         s = logic.summarize_lines([j(type="custom-title", customTitle="調査タスク")])

@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import logic
+import tasklist
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()
@@ -182,12 +183,16 @@ class PRCache:
 # ---------------------------------------------------------------- 一覧の組み立て
 
 class Board:
-    def __init__(self, pr_enabled=True):
+    def __init__(self, pr_enabled=True, tasks_path=None, recent_done=5, warn=None):
         self.tracker = logic.SinceTracker()
         self.prs = PRCache(pr_enabled)
         self.lock = threading.Lock()
         self.targets = {}   # 行 id -> herdr focus の対象（名前、無名ならペイン）と tab
         self._cache = (0.0, None)
+        self.tasks = tasklist.TaskFile(tasks_path) if tasks_path else None
+        self.recent_done_n = recent_done
+        self.warn = warn            # 警告が変わったときに呼ぶ（サーバーは stderr に 1 行出す）
+        self._last_warning = None
 
     def snapshot(self):
         with self.lock:
@@ -212,11 +217,33 @@ class Board:
         self.targets = targets
         order = {s: i for i, s in enumerate(logic.SECTION_ORDER)}
         # セクション内は、その状態になったのが新しい順
+        warning, recent = self._overlay_tasks(rows)
         rows.sort(key=lambda r: (order[r["section"]], -r["since"]))
         counts = {s: 0 for s in logic.SECTION_ORDER}
         for r in rows:
             counts[r["section"]] += 1
-        return {"now": now, "error": error, "counts": counts, "rows": rows}
+        return {"now": now, "error": error, "warning": warning, "counts": counts, "rows": rows,
+                "recent_done": recent}
+
+    def _overlay_tasks(self, rows):
+        """--tasks の表を一覧に重ね、(警告, 直近の完了) を返す。"""
+        if not self.tasks:
+            return None, None
+        data = self.tasks.load()
+        warning = self.tasks.warning
+        if warning != self._last_warning and warning and self.warn:
+            self.warn(warning)
+        self._last_warning = warning
+        by_name = {}
+        for e in data["active"]:
+            by_name.setdefault(e["name"], e)  # 同じ名前が複数あれば上の行
+        for r in rows:
+            e = by_name.get(r.get("agent_name")) or by_name.get(r.get("name"))
+            if e:
+                logic.overlay_task(r, e, tasklist.needs_you(e.get("status")))
+        recent = [{k: logic.short(e.get(k), 300) for k in ("name", "repo", "ended", "task", "result")}
+                  for e in tasklist.recent_done(data["done"], self.recent_done_n)]
+        return warning, recent
 
     def _row(self, a, metas, now, targets):
         status = a.get("agent_status") or "unknown"
@@ -240,6 +267,7 @@ class Board:
         return {
             "id": row_id,
             "name": name,
+            "agent_name": a.get("name"),  # Herdr の名前（--tasks の表の「名前」と突き合わせる）
             "status": status,
             "section": section,
             "reason": reason,
@@ -341,8 +369,14 @@ def main(argv=None):
     ap.add_argument("--no-pr", action="store_true", help="gh で PR を調べない")
     ap.add_argument("--tui", action="store_true", help="端末に表示する（サーバーは立てない）")
     ap.add_argument("--interval", type=float, default=3.0, help="端末版の更新間隔（秒）")
+    ap.add_argument("--tasks", metavar="PATH", help="作業の一覧表（Markdown）を重ねて表示する")
+    ap.add_argument("--recent-done", type=int, default=5, metavar="N", help="--tasks の完了の表から出す件数")
     args = ap.parse_args(argv)
-    board = Board(pr_enabled=not args.no_pr)
+    def warn(msg):
+        print(f"herdr-board: {msg}", file=sys.stderr)
+
+    board = Board(pr_enabled=not args.no_pr, tasks_path=args.tasks, recent_done=max(0, args.recent_done),
+                  warn=None if args.tui else warn)
     if args.tui:
         import tui
         return tui.run(board, max(0.5, args.interval))

@@ -138,6 +138,8 @@ def render(data, cols, sel_id, msg=None):
     hint = "Up/Down j/k: select   Enter/click: open in terminal   q: quit"
     if data.get("error"):
         lines.append(fg(196) + fit(sanitize("herdr: " + data["error"]), cols) + RESET)
+    elif data.get("warning") and not msg:
+        lines.append(fg(178) + fit(sanitize(data["warning"]), cols) + RESET)
     elif msg:
         lines.append(fg(229) + fit(sanitize(msg), cols) + RESET)
     else:
@@ -159,7 +161,24 @@ def render(data, cols, sel_id, msg=None):
             lines.append(l1)
             ids[len(lines)] = r.get("id")
             lines.append(l2)
+    if data.get("recent_done") is not None:
+        lines.extend(_recent_done_lines(data["recent_done"], cols, name_w))
     return lines, ids
+
+
+def _recent_done_lines(done, cols, name_w):
+    """--tasks の完了の表。Herdr にいないので行 id を持たせない（選択・移動の対象外）。"""
+    out = ["", (fg(COLOR[logic.IDLE]) + BOLD if done else DIM) + f"RECENT DONE ({len(done)})" + RESET]
+    left_w = 3 + name_w + 1
+    for d in done:
+        ended = sanitize(d.get("ended"))
+        right = "  ".join(x for x in (sanitize(d.get("repo")) if d.get("repo") != d.get("name") else "", ended) if x)
+        title_w = max(0, cols - left_w - disp_width(right) - 2)
+        out.append(DIM + " - " + RESET + fit(sanitize(d.get("name")), name_w) + " "
+                   + fit(sanitize(d.get("task")), title_w) + "  " + DIM + right + RESET)
+        if d.get("result"):
+            out.append(" " * left_w + DIM + fit(sanitize(d["result"]), cols - left_w) + RESET)
+    return out
 
 
 def _row_lines(r, cols, name_w, color, sel):
