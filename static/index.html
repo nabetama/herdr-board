@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>herdr / board</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --line: #232833; --fg: #d7dce5; --dim: #7c8596;
+    --orange: #f0883e; --green: #3fb950; --blue: #58a6ff; --gray: #6e7681; --red: #f85149; --yellow: #d29922;
+    --mono: ui-monospace, "SF Mono", Menlo, "Hiragino Kaku Gothic ProN", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           display: flex; align-items: center; gap: 14px; padding: 12px 20px; flex-wrap: wrap; }
+  h1 { margin: 0; font: 600 16px var(--mono); color: var(--fg); }
+  h1 span { color: var(--dim); font-weight: 400; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge { font: 12px var(--mono); padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--dim); }
+  .badge b { font-weight: 600; }
+  .badge.needs_you.on { color: var(--orange); border-color: var(--orange); }
+  .badge.done.on { color: var(--green); border-color: #2a6b37; }
+  .badge.working.on { color: var(--blue); border-color: #2c4f7c; }
+  .badge.idle.on { color: var(--fg); }
+  .meta { margin-left: auto; color: var(--dim); font-size: 12px; display: flex; gap: 14px; }
+  .meta kbd { font: 11px var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+  main { padding: 6px 20px 40px; max-width: 1400px; }
+  .err { color: var(--red); margin: 12px 0; font-family: var(--mono); }
+  section h2 { font: 600 12px var(--mono); letter-spacing: .08em; margin: 18px 0 6px; display: flex; gap: 8px; align-items: center; }
+  section h2 .n { color: var(--dim); font-weight: 400; }
+  section.needs_you h2 { color: var(--orange); }
+  section.done h2 { color: var(--green); }
+  section.working h2 { color: var(--blue); }
+  section.idle h2 { color: var(--gray); }
+  section.empty h2 { opacity: .45; }
+  .row { display: grid; grid-template-columns: 14px minmax(120px, 230px) 1fr auto auto 48px; gap: 12px;
+         align-items: center; padding: 7px 12px; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
+  .row:hover { background: var(--panel); }
+  .row.sel { border-color: var(--fg); background: var(--panel); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .needs_you .dot { background: var(--orange); box-shadow: 0 0 6px var(--orange); }
+  .done .dot { background: var(--green); }
+  .working .dot { background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
+  .idle .dot { background: var(--gray); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .name { font: 13px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .body { min-width: 0; }
+  .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .needs_you .sub { color: var(--orange); }
+  .reason { font: 11px var(--mono); color: var(--bg); background: var(--orange); border-radius: 3px; padding: 0 5px; margin-right: 6px; }
+  .tags { display: flex; gap: 6px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }
+  .tag { font: 11px var(--mono); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; color: var(--dim); white-space: nowrap; }
+  .tag.bg { color: var(--blue); border-color: #2c4f7c; }
+  .tag.pr a { color: inherit; text-decoration: none; }
+  .tag.pr.pass { color: var(--green); } .tag.pr.fail { color: var(--red); border-color: var(--red); }
+  .tag.pr.pending { color: var(--yellow); }
+  .kind { font: 12px var(--mono); color: var(--dim); }
+  .elapsed { font: 12px var(--mono); color: var(--dim); text-align: right; }
+  .none { color: var(--dim); font-size: 12px; padding: 2px 12px 4px 38px; }
+  .toast { position: fixed; bottom: 16px; right: 20px; background: var(--panel); border: 1px solid var(--line);
+           padding: 6px 12px; border-radius: 6px; font-size: 12px; opacity: 0; transition: opacity .2s; }
+  .toast.on { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>herdr <span>/</span> board</h1>
+  <div class="badges" id="badges"></div>
+  <div class="meta"><span id="updated">—</span><span><kbd>↑</kbd><kbd>↓</kbd> 選択 · <kbd>Enter</kbd> ターミナルで開く</span></div>
+</header>
+<main id="main"></main>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const SECTIONS = [
+  ["needs_you", "NEEDS YOU", "needs you"],
+  ["done", "DONE · UNSEEN", "done · unseen"],
+  ["working", "WORKING", "working"],
+  ["idle", "IDLE", "idle"],
+];
+let rows = [];          // 表示順の行
+let selId = null;       // 選択中の行 id（更新しても id で追う）
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function prTag(pr) {
+  const t = el("span", "tag pr " + (pr.ci || ""));
+  const a = el("a", null, pr.label);
+  a.href = pr.url; a.target = "_blank"; a.rel = "noopener";
+  a.addEventListener("click", ev => ev.stopPropagation());
+  t.appendChild(a);
+  const bits = [];
+  if (pr.state && pr.state !== "open") bits.push(pr.state);
+  if (pr.draft) bits.push("draft");
+  if (pr.ci) bits.push({pass: "CI ✓", fail: "CI ✗", pending: "CI …"}[pr.ci]);
+  if (pr.review === "approved") bits.push("approved");
+  if (pr.review === "changes_requested") bits.push("changes requested");
+  if (bits.length) t.appendChild(document.createTextNode(" " + bits.join(" · ")));
+  return t;
+}
+
+function render(data) {
+  const main = document.getElementById("main");
+  main.textContent = "";
+  if (data.error) main.appendChild(el("div", "err", "herdr: " + data.error));
+
+  const badges = document.getElementById("badges");
+  badges.textContent = "";
+  for (const [key, , label] of SECTIONS) {
+    const n = data.counts[key] || 0;
+    const b = el("span", "badge " + key + (n ? " on" : ""));
+    b.appendChild(el("b", null, String(n)));
+    b.appendChild(document.createTextNode(" " + label));
+    badges.appendChild(b);
+  }
+  document.getElementById("updated").textContent =
+    "更新 " + new Date(data.now * 1000).toLocaleTimeString("ja-JP", {hour12: false});
+
+  rows = data.rows;
+  if (!rows.some(r => r.id === selId)) selId = rows.length ? rows[0].id : null;
+
+  for (const [key, label] of SECTIONS) {
+    const list = rows.filter(r => r.section === key);
+    const sec = el("section", key + (list.length ? "" : " empty"));
+    const h = el("h2", null, label);
+    h.appendChild(el("span", "n", String(list.length)));
+    sec.appendChild(h);
+    if (!list.length) {
+      if (key === "needs_you") sec.appendChild(el("div", "none", "あなたを待っているエージェントはありません"));
+      main.appendChild(sec);
+      continue;
+    }
+    for (const r of list) {
+      const row = el("div", "row" + (r.id === selId ? " sel" : ""));
+      row.dataset.id = r.id;
+      row.appendChild(el("span", "dot"));
+      const name = el("span", "name", r.name);
+      name.title = r.name;
+      row.appendChild(name);
+      const body = el("div", "body");
+      const title = el("div", "title", r.title);
+      title.title = r.title;
+      body.appendChild(title);
+      if (r.sub || r.reason) {
+        const sub = el("div", "sub");
+        if (r.reason) sub.appendChild(el("span", "reason", r.reason));
+        sub.appendChild(document.createTextNode(r.sub || ""));
+        sub.title = r.sub || "";
+        body.appendChild(sub);
+      }
+      row.appendChild(body);
+      const tags = el("div", "tags");
+      if (r.bg) tags.appendChild(el("span", "tag bg", r.bg));
+      if (r.pr) tags.appendChild(prTag(r.pr));
+      if (r.repo && r.repo !== r.name) tags.appendChild(el("span", "tag", r.repo));
+      row.appendChild(tags);
+      row.appendChild(el("span", "kind", r.kind));
+      row.appendChild(el("span", "elapsed", r.elapsed));
+      row.addEventListener("click", () => { select(r.id); openSel(); });
+      sec.appendChild(row);
+    }
+    main.appendChild(sec);
+  }
+}
+
+function select(id, scroll) {
+  selId = id;
+  for (const e of document.querySelectorAll(".row")) {
+    const on = e.dataset.id === id;
+    e.classList.toggle("sel", on);
+    if (on && scroll) e.scrollIntoView({block: "nearest"});
+  }
+}
+
+function move(d) {
+  if (!rows.length) return;
+  let i = rows.findIndex(r => r.id === selId);
+  i = Math.max(0, Math.min(rows.length - 1, (i < 0 ? 0 : i + d)));
+  select(rows[i].id, true);
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("on");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("on"), 1800);
+}
+
+async function openSel() {
+  if (!selId) return;
+  const r = rows.find(x => x.id === selId);
+  try {
+    const res = await fetch("/api/focus", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Herdr-Board": "1"},
+      body: JSON.stringify({id: selId}),
+    });
+    const j = await res.json();
+    toast(j.ok ? `→ ${r ? r.name : ""}` : `移動できませんでした: ${j.how || j.error}`);
+  } catch (e) { toast("移動できませんでした"); }
+  refresh();
+}
+
+document.addEventListener("keydown", ev => {
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.key === "ArrowDown" || ev.key === "j") { move(1); ev.preventDefault(); }
+  else if (ev.key === "ArrowUp" || ev.key === "k") { move(-1); ev.preventDefault(); }
+  else if (ev.key === "Enter") { openSel(); ev.preventDefault(); }
+});
+
+let busy = false;
+async function refresh() {
+  if (busy) return;
+  busy = true;
+  try {
+    const res = await fetch("/api/board", {cache: "no-store"});
+    render(await res.json());
+  } catch (e) {
+    document.getElementById("updated").textContent = "サーバーに接続できません";
+  } finally { busy = false; }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
