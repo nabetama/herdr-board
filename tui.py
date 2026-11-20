@@ -91,6 +91,53 @@ def fit(s, w, pad=True):
     return s2 + (" " * (w - cur) if pad else "")
 
 
+_WRAP_TOKEN_RE = re.compile(r"[!-~]+| +|.", re.S)
+
+
+def wrap(s, w):
+    """表示幅 w で折り返した行のリスト。ASCII の語はなるべく途中で切らない。s は sanitize 済みの 1 行。"""
+    w = max(2, w)  # 全角 1 文字は入る幅にする
+    lines, cur, cw = [], "", 0
+    for tok in _WRAP_TOKEN_RE.findall(s or ""):
+        tw = disp_width(tok)
+        if cw + tw <= w:
+            cur, cw = cur + tok, cw + tw
+            continue
+        if tok.startswith(" "):  # 行末に来た空白は捨てて折り返す
+            lines.append(cur.rstrip())
+            cur, cw = "", 0
+            continue
+        if cur:
+            lines.append(cur.rstrip())
+            cur, cw = "", 0
+        if tw <= w:
+            cur, cw = tok, tw
+            continue
+        for c in tok:  # 幅より長い語は文字の切れ目で折る
+            x = char_width(c)
+            if cw + x > w:
+                lines.append(cur)
+                cur, cw = "", 0
+            cur, cw = cur + c, cw + x
+    lines.append(cur.rstrip() if lines else cur)
+    return lines
+
+
+def wrap_text(text, w, indent=0):
+    """複数行の本文を、1 行ずつ sanitize してから表示幅 w で折り返す。行頭の字下げは残す（タブは 4 桁）。"""
+    out = []
+    for raw in (text or "").splitlines() or [""]:
+        raw = raw.replace("\t", "    ")
+        lead = min(len(raw) - len(raw.lstrip(" ")), w // 2)
+        body = sanitize(raw)
+        if not body:
+            out.append(" " * indent)
+            continue
+        pad = " " * (indent + lead)
+        out.extend(pad + l for l in wrap(body, w - indent - lead))
+    return out
+
+
 def visible(s):
     """ANSI エスケープを除いた文字列（テスト・幅計算用）。"""
     return _ANSI_RE.sub("", s)
@@ -114,7 +161,11 @@ def pr_text(pr):
     return sanitize(" ".join(bits))
 
 
-def render(data, cols, sel_id, msg=None):
+HINT = "Up/Down j/k: select   Enter/click: open in terminal   d: detail   q: quit"
+HINT_DETAIL = "j/k: select  Enter: open  d: close  J/K PgUp/PgDn: scroll  q: quit"
+
+
+def render(data, cols, sel_id, msg=None, detail_open=False):
     """描く行（ANSI 付き）と、行番号 -> 行 id の対応を返す。行番号は 0 始まりで、ヘッダーを含む。"""
     cols = max(40, cols)
     lines, ids = [], {}
@@ -135,7 +186,7 @@ def render(data, cols, sel_id, msg=None):
     else:
         lines.append("  ".join(head) + " " * gap + DIM + clock + RESET)
     # 2 行目: 操作ヒントか、直前の操作の結果
-    hint = "Up/Down j/k: select   Enter/click: open in terminal   q: quit"
+    hint = HINT_DETAIL if detail_open else HINT
     if data.get("error"):
         lines.append(fg(196) + fit(sanitize("herdr: " + data["error"]), cols) + RESET)
     elif data.get("warning") and not msg:
@@ -220,6 +271,91 @@ def _row_lines(r, cols, name_w, color, sel):
     return l1, l2
 
 
+def detail_lines(detail, cols):
+    """詳細（Board.detail() の戻り値）を画面の行（ANSI 付き）にする。全行が表示幅 cols 以下になる。
+
+    出す順: 結果ファイル（--results-dir が無ければ出さない）、--tasks の表の行（--tasks が無ければ出さない）、
+    最後の応答。中身はすべて sanitize を通す。"""
+    cols = max(20, cols)
+    out = []
+
+    def head(label, value=""):
+        out.append(BOLD + fg(75) + fit(label + sanitize(value), cols, pad=False) + RESET)
+
+    def note(text):
+        out.append(DIM + fit("  " + sanitize(text), cols, pad=False) + RESET)
+
+    def body(text):
+        out.extend(wrap_text(text, cols, indent=2))
+
+    if not detail:
+        note("(no detail for this agent)")
+        return out
+    res = detail.get("result")
+    if res is not None:
+        head("RESULT FILE")
+        out.extend(DIM + l + RESET for l in wrap_text(res.get("path") or "", cols, indent=2))
+        state = res.get("state")
+        if state == "found":
+            body(res.get("text") or "")
+            if res.get("truncated"):
+                note("(cut at 256 KB; open the file to read the rest)")
+        elif state == "missing":
+            note("(none: the file does not exist)")
+        elif state == "refused":
+            note("(none: not read; the name has / or .., or the path is outside the directory)")
+        else:
+            note("(none: could not read: " + (res.get("error") or "") + ")")
+        out.append("")
+    if detail.get("tasks"):
+        task = detail.get("task")
+        if not task:
+            head("TASK")
+            note("(none: no row with this name in --tasks)")
+        else:
+            active = task.get("table") == "active"
+            head("TASK (in progress)" if active else "TASK (done)")
+            fields = (("依頼内容", "task"), ("状態", "status"), ("結果・メモ", "note")) if active else \
+                (("依頼内容", "task"), ("終了", "ended"), ("結果", "result"))
+            for label, key in fields:
+                out.append(DIM + "  " + label + RESET)
+                if task.get(key):
+                    out.extend(wrap_text(task[key], cols, indent=4))
+                else:
+                    out.append(DIM + "    -" + RESET)
+        out.append("")
+    head("LAST REPLY")
+    if detail.get("last_assistant"):
+        body(detail["last_assistant"])
+    else:
+        note("(none: no conversation log)")
+    return out
+
+
+def detail_bar(name, top, shown, total, cols):
+    """詳細の上に固定で出す 1 行（名前と表示中の範囲）。"""
+    pos = f"{top + 1}-{top + shown}/{total}" if total else "0/0"
+    right = f" {pos}  d: close "
+    left = " DETAIL  " + sanitize(name)
+    left = fit(left, max(0, cols - len(right)))
+    return SEL_BG + BOLD + left + RESET + SEL_BG + DIM + right[:max(0, cols - disp_width(left))] + RESET
+
+
+# 詳細を開いたとき、一覧と詳細（上の 1 行を含む）にそれぞれこの行数を取れなければ、詳細だけを出す
+MIN_PANE = 4
+
+
+def split_body(rows, detail_open):
+    """本文（ヘッダーを除く）の行数を、(一覧, 詳細) に分ける。詳細の行数は上の 1 行を含む。"""
+    body_h = max(1, rows - HEADER_LINES)
+    if not detail_open:
+        return body_h, 0
+    list_h = body_h // 2
+    if list_h < MIN_PANE or body_h - list_h < MIN_PANE:
+        return 0, body_h
+    return list_h, body_h - list_h
+
+
 def scroll_top(n_lines, rows, sel_lines, top):
     """本文（ヘッダーを除く）の表示開始位置。選択行が見えるように動かす。"""
     body_h = max(1, rows - HEADER_LINES)
@@ -237,7 +373,8 @@ _MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 def parse_input(buf):
     """キー入力を解釈する。戻り値: (イベントのリスト, 次に回す未完の入力)。
-    イベント: ("move", -1|1) / ("open",) / ("quit",) / ("click", 行番号0始まり)"""
+    イベント: ("move", -1|1) / ("open",) / ("quit",) / ("click", 行番号0始まり)
+              / ("detail",)（詳細の開閉） / ("scroll", -1|1)（詳細を 1 行） / ("page", -1|1)（詳細を半画面）"""
     events = []
     i = 0
     while i < len(buf):
@@ -258,8 +395,12 @@ def parse_input(buf):
                     events.append(("move", -1 if b == 64 else 1))
                 i += m.end()
                 continue
-            if rest in ("\x1b", "\x1b[", "\x1bO"):
-                return events, rest
+            if rest in ("\x1b", "\x1bO") or re.fullmatch(r"\x1b\[[0-9;]*", rest):
+                return events, rest  # 途中で切れたシーケンス
+            if rest.startswith(("\x1b[5~", "\x1b[6~")):  # PageUp / PageDown
+                events.append(("page", -1 if rest[2] == "5" else 1))
+                i += 4
+                continue
             seq = rest[:3]
             if seq in ("\x1b[A", "\x1bOA"):
                 events.append(("move", -1))
@@ -279,12 +420,16 @@ def parse_input(buf):
             events.append(("open",))
         elif c in ("q", "Q"):
             events.append(("quit",))
+        elif c == "d":
+            events.append(("detail",))
+        elif c in ("J", "K"):
+            events.append(("scroll", 1 if c == "J" else -1))
         i += 1
     return events, ""
 
 
 class App:
-    def __init__(self, board, interval=3.0, out=sys.stdout):
+    def __init__(self, board, interval=3.0, out=sys.stdout, web=None):
         self.board = board
         self.interval = interval
         self.out = out
@@ -294,23 +439,61 @@ class App:
         self.top = 0
         self.msg = None
         self.msg_until = 0.0
-        self.screen_ids = {}  # 画面の行番号 -> 行 id
+        self.screen_ids = {}  # 画面の行番号 -> 行 id（一覧の範囲だけ）
         self.resized = True
+        self.detail_open = False
+        self.detail = None      # 選択中の行の Board.detail()
+        self.detail_id = None   # self.detail がどの行 id のものか
+        self.dtop = 0           # 詳細の表示開始位置
+        self.page = 10          # 半画面の行数（描くたびに詳細の高さから決める）
+        self._dlines = (None, None, [])  # (detail, cols, 行) の控え。毎回折り返し直さないように
+        # --port を付けたとき: 起動できたら URL をしばらく出し、できなければ警告として 2 行目に出し続ける
+        web = web or {}
+        self.web_error = web.get("error")
+        if web.get("url"):
+            self.msg, self.msg_until = f"web: {web['url']}", time.time() + 10
 
     # 選択中のエージェントが一覧から消えても、この回数の更新までは選択を保つ（一時的な欠けで先頭に飛ばないように）
     KEEP_MISSING = 2
 
     def refresh(self):
         self.data = self.board.snapshot()
+        if self.web_error:  # snapshot はブラウザ版と共有しているので書き換えずに写す
+            self.data = dict(self.data, warning="  ".join(w for w in (self.web_error, self.data.get("warning")) if w))
         ids = [r["id"] for r in self.ordered()]
-        if not ids:
+        if ids:
+            if self.sel_id in ids:
+                self.missing = 0
+            else:
+                self.missing += 1
+                if self.sel_id is None or self.missing > self.KEEP_MISSING:
+                    self.sel_id, self.missing = ids[0], 0
+        self.load_detail(force=True)
+
+    def load_detail(self, force=False):
+        """詳細を開いていれば、選択中の行の詳細を読む。選択が変わったときはスクロール位置を先頭に戻す。
+        force でなければ、選択が変わったときだけ読む（ファイルを読むので、キーを押すたびには読まない）。"""
+        if not self.detail_open:
             return
-        if self.sel_id in ids:
-            self.missing = 0
+        if self.sel_id != self.detail_id:
+            self.dtop = 0
+        elif not force:
             return
-        self.missing += 1
-        if self.sel_id is None or self.missing > self.KEEP_MISSING:
-            self.sel_id, self.missing = ids[0], 0
+        self.detail = self.board.detail(self.sel_id) if self.sel_id else None
+        self.detail_id = self.sel_id
+
+    def toggle_detail(self):
+        self.detail_open = not self.detail_open
+        if self.detail_open:
+            self.load_detail(force=True)
+
+    def scroll_detail(self, n):
+        if self.detail_open:
+            self.dtop = max(0, self.dtop + n)  # 下の端は描くときにそろえる
+
+    def select(self, row_id):
+        self.sel_id = row_id
+        self.load_detail()
 
     def ordered(self):
         order = {k: i for i, (k, _, _) in enumerate(SECTIONS)}
@@ -322,7 +505,7 @@ class App:
         if not ids:
             return
         i = ids.index(self.sel_id) if self.sel_id in ids else 0
-        self.sel_id = ids[max(0, min(len(ids) - 1, i + d))]
+        self.select(ids[max(0, min(len(ids) - 1, i + d))])
 
     def open(self):
         if not self.sel_id:
@@ -337,21 +520,38 @@ class App:
     def draw(self):
         cols, rows = os.get_terminal_size(self.out.fileno()) if self.out.isatty() else (100, 40)
         msg = self.msg if time.time() < self.msg_until else None
-        lines, ids = render(self.data, cols, self.sel_id, msg)
+        lines, ids = render(self.data, cols, self.sel_id, msg, self.detail_open)
         body = lines[HEADER_LINES:]
+        list_h, detail_h = split_body(rows, self.detail_open)
         sel_lines = [n - HEADER_LINES for n, i in ids.items() if i == self.sel_id]
-        self.top = scroll_top(len(body), rows, sel_lines, self.top)
-        shown = lines[:HEADER_LINES] + body[self.top:self.top + rows - HEADER_LINES]
+        self.top = scroll_top(len(body), list_h + HEADER_LINES, sel_lines, self.top)
+        shown = lines[:HEADER_LINES] + body[self.top:self.top + list_h]
+        shown += [""] * (HEADER_LINES + list_h - len(shown))
         self.screen_ids = {}
         for n, i in ids.items():
             if n < HEADER_LINES:
                 continue
             sn = n - self.top
-            if HEADER_LINES <= sn < rows:
+            if HEADER_LINES <= sn < HEADER_LINES + list_h:
                 self.screen_ids[sn] = i
+        if detail_h:
+            shown += self.detail_view(cols, detail_h)
         self.out.write(frame(shown, rows, clear_all=self.resized))
         self.resized = False
         self.out.flush()
+
+    def detail_view(self, cols, height):
+        """詳細の欄（上の 1 行 + 本文 height - 1 行）。"""
+        d = self.detail
+        if self._dlines[0] is not d or self._dlines[1] != cols:
+            self._dlines = (d, cols, detail_lines(d, cols))
+        dl = self._dlines[2]
+        h = max(1, height - 1)
+        self.page = max(1, h // 2)
+        self.dtop = max(0, min(self.dtop, len(dl) - h))
+        part = dl[self.dtop:self.dtop + h]
+        name = (d or {}).get("name") or ""
+        return [detail_bar(name, self.dtop, len(part), len(dl), cols)] + part
 
 
 def frame(shown, rows, clear_all=False):
@@ -365,7 +565,7 @@ def frame(shown, rows, clear_all=False):
     return "".join(parts)
 
 
-def run(board, interval=3.0):
+def run(board, interval=3.0, web=None):
     import termios
     import tty
 
@@ -374,7 +574,7 @@ def run(board, interval=3.0):
         return 1
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    app = App(board, interval)
+    app = App(board, interval, web=web)
 
     def on_winch(*_):
         app.resized = True
@@ -415,11 +615,17 @@ def run(board, interval=3.0):
                     return 0
                 if ev[0] == "move":
                     app.move(ev[1])
+                elif ev[0] == "detail":
+                    app.toggle_detail()
+                elif ev[0] == "scroll":
+                    app.scroll_detail(ev[1])
+                elif ev[0] == "page":
+                    app.scroll_detail(ev[1] * app.page)
                 elif ev[0] == "open":
                     app.open()
                     last = 0.0
                 elif ev[0] == "click" and ev[1] in app.screen_ids:
-                    app.sel_id = app.screen_ids[ev[1]]
+                    app.select(app.screen_ids[ev[1]])
                     app.open()
                     last = 0.0
             app.draw()
