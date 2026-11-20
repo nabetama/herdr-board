@@ -429,7 +429,7 @@ def parse_input(buf):
 
 
 class App:
-    def __init__(self, board, interval=3.0, out=sys.stdout):
+    def __init__(self, board, interval=3.0, out=sys.stdout, web=None):
         self.board = board
         self.interval = interval
         self.out = out
@@ -447,12 +447,19 @@ class App:
         self.dtop = 0           # 詳細の表示開始位置
         self.page = 10          # 半画面の行数（描くたびに詳細の高さから決める）
         self._dlines = (None, None, [])  # (detail, cols, 行) の控え。毎回折り返し直さないように
+        # --port を付けたとき: 起動できたら URL をしばらく出し、できなければ警告として 2 行目に出し続ける
+        web = web or {}
+        self.web_error = web.get("error")
+        if web.get("url"):
+            self.msg, self.msg_until = f"web: {web['url']}", time.time() + 10
 
     # 選択中のエージェントが一覧から消えても、この回数の更新までは選択を保つ（一時的な欠けで先頭に飛ばないように）
     KEEP_MISSING = 2
 
     def refresh(self):
         self.data = self.board.snapshot()
+        if self.web_error:  # snapshot はブラウザ版と共有しているので書き換えずに写す
+            self.data = dict(self.data, warning="  ".join(w for w in (self.web_error, self.data.get("warning")) if w))
         ids = [r["id"] for r in self.ordered()]
         if ids:
             if self.sel_id in ids:
@@ -558,7 +565,7 @@ def frame(shown, rows, clear_all=False):
     return "".join(parts)
 
 
-def run(board, interval=3.0):
+def run(board, interval=3.0, web=None):
     import termios
     import tty
 
@@ -567,7 +574,7 @@ def run(board, interval=3.0):
         return 1
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    app = App(board, interval)
+    app = App(board, interval, web=web)
 
     def on_winch(*_):
         app.resized = True

@@ -4,6 +4,7 @@
   python3 board.py [--port 7788] [--no-pr]   # ブラウザ版
   python3 board.py --tui [--no-pr]            # 端末版（サーバーは立てない）
   python3 board.py --tui --results-dir DIR    # 詳細に DIR/<名前>.md を出す
+  python3 board.py --tui --port 7788          # 端末版と同じプロセスでブラウザ版も動かす
 
 ブラウザ版は 127.0.0.1 にだけ bind する。ブラウザで http://127.0.0.1:7788/ を開く。
 """
@@ -29,6 +30,7 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 TAIL_BYTES = 512 * 1024
 HEAD_BYTES = 256 * 1024
 HERDR_TIMEOUT = 10
+DEFAULT_PORT = 7788
 RESULT_MAX_BYTES = 256 * 1024
 RESULTS_DIR_ENV = "HERDR_BOARD_RESULTS_DIR"
 
@@ -229,7 +231,7 @@ class PRCache:
 # ---------------------------------------------------------------- 一覧の組み立て
 
 class Board:
-    def __init__(self, pr_enabled=True, tasks_path=None, recent_done=5, warn=None, results_dir=None):
+    def __init__(self, pr_enabled=True, tasks_path=None, recent_done=5, warn=None, results_dir=None, max_age=1.0):
         self.tracker = logic.SinceTracker()
         self.prs = PRCache(pr_enabled)
         self.lock = threading.Lock()
@@ -237,14 +239,16 @@ class Board:
         self.details = {}   # 行 id -> 詳細の材料（名前・最後の応答・表の行）。targets と同じく直近の一覧の分だけ
         self.results_dir = results_dir
         self._cache = (0.0, None)
+        self.max_age = max_age      # snapshot() がこの秒数より新しい一覧を返し直す（端末版とブラウザ版で共有するとき用）
         self.tasks = tasklist.TaskFile(tasks_path) if tasks_path else None
         self.recent_done_n = recent_done
         self.warn = warn            # 警告が変わったときに呼ぶ（サーバーは stderr に 1 行出す）
         self._last_warning = None
 
     def snapshot(self):
+        """一覧。max_age 秒以内に作ったものがあればそれを返す。作るのは lock を持った 1 スレッドだけ。"""
         with self.lock:
-            if time.time() - self._cache[0] < 1.0 and self._cache[1]:
+            if time.time() - self._cache[0] < self.max_age and self._cache[1]:
                 return self._cache[1]
             data = self._build()
             self._cache = (time.time(), data)
@@ -452,9 +456,28 @@ def make_handler(board, port):
     return Handler
 
 
+def start_web(board, port):
+    """ブラウザ版のサーバーを別スレッド（daemon）で動かす。戻り値: (サーバー, None) か、起動できなければ (None, 理由)。"""
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(board, port))
+    except OSError as ex:
+        return None, ex.strerror or str(ex)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, name="herdr-board-web", daemon=True).start()
+    return srv, None
+
+
+def stop_web(srv):
+    """start_web() で動かしたサーバーを止めて、ポートを閉じる。"""
+    if srv:
+        srv.shutdown()
+        srv.server_close()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Herdr のエージェントを状態ごとに一覧する web UI")
-    ap.add_argument("--port", type=int, default=7788)
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"ブラウザ版のポート（既定 {DEFAULT_PORT}）。--tui と一緒に付けると、ブラウザ版も同じプロセスで動かす")
     ap.add_argument("--no-pr", action="store_true", help="gh で PR を調べない")
     ap.add_argument("--tui", action="store_true", help="端末に表示する（サーバーは立てない）")
     ap.add_argument("--interval", type=float, default=3.0, help="端末版の更新間隔（秒）")
@@ -471,9 +494,21 @@ def main(argv=None):
                   warn=None if args.tui else warn, results_dir=results_dir)
     if args.tui:
         import tui
-        return tui.run(board, max(0.5, args.interval))
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(board, args.port))
-    print(f"herdr-board: http://127.0.0.1:{args.port}/", file=sys.stderr)
+        interval = max(0.5, args.interval)
+        if args.port is None:
+            return tui.run(board, interval)
+        # 端末版とブラウザ版で同じ Board を使う。一覧を作るのは、どちらかが前回から interval 近く経って求めたときだけ
+        board.max_age = max(1.0, interval - 0.5)
+        srv, err = start_web(board, args.port)
+        web = {"error": f"web: could not open port {args.port} ({err}); terminal only"} if err else \
+            {"url": f"http://127.0.0.1:{args.port}/"}
+        try:
+            return tui.run(board, interval, web=web)
+        finally:
+            stop_web(srv)  # q / Ctrl-C / SIGHUP / SIGTERM のどれで終えてもポートを閉じる
+    port = DEFAULT_PORT if args.port is None else args.port
+    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(board, port))
+    print(f"herdr-board: http://127.0.0.1:{port}/", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
