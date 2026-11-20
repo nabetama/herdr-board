@@ -3,18 +3,21 @@
 
   python3 board.py [--port 7788] [--no-pr]   # ブラウザ版
   python3 board.py --tui [--no-pr]            # 端末版（サーバーは立てない）
+  python3 board.py --tui --results-dir DIR    # 詳細に DIR/<名前>.md を出す
 
 ブラウザ版は 127.0.0.1 にだけ bind する。ブラウザで http://127.0.0.1:7788/ を開く。
 """
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import logic
 import tasklist
@@ -26,6 +29,8 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 TAIL_BYTES = 512 * 1024
 HEAD_BYTES = 256 * 1024
 HERDR_TIMEOUT = 10
+RESULT_MAX_BYTES = 256 * 1024
+RESULTS_DIR_ENV = "HERDR_BOARD_RESULTS_DIR"
 
 
 def run(args, cwd=None, timeout=HERDR_TIMEOUT):
@@ -110,6 +115,47 @@ def first_prompt_for(path):
     return found
 
 
+def display_path(p):
+    """ホームディレクトリの下なら ~ から始まる形にする（画面に出す用）。"""
+    s, home = str(p), str(HOME)
+    return "~" + s[len(home):] if s == home or s.startswith(home + os.sep) else s
+
+
+def read_result(results_dir, name, limit=RESULT_MAX_BYTES):
+    """結果ファイル <results_dir>/<name>.md を読む。
+
+    返す dict: path（画面に出す形）、state（"found" / "missing" / "refused" / "unreadable"）、
+    text（found のときの本文）、truncated（limit バイトで切ったか）、error（unreadable の理由）。
+    名前に / や .. を含むとき、解決したパスが results_dir の外に出るときは読まない（refused）。
+    """
+    out = {"path": None, "state": "refused", "text": None, "truncated": False, "error": None}
+    name = name or ""
+    if not name or "/" in name or "\\" in name or ".." in name or "\0" in name:
+        return out
+    base = Path(results_dir).expanduser()
+    p = base / f"{name}.md"
+    out["path"] = display_path(p)
+    try:
+        resolved = p.resolve()
+        if base.resolve() not in resolved.parents:
+            return out
+        if not p.exists():
+            out["state"] = "missing"
+            return out
+        if not stat.S_ISREG(resolved.stat().st_mode):  # FIFO などを開いて止まらないように
+            out["state"], out["error"] = "unreadable", "not a regular file"
+            return out
+        with open(resolved, "rb") as f:
+            data = f.read(limit + 1)
+    except (OSError, RuntimeError) as ex:  # RuntimeError: Python 3.12 以前でシンボリックリンクが循環しているとき
+        out["state"], out["error"] = "unreadable", getattr(ex, "strerror", None) or str(ex)
+        return out
+    out["state"] = "found"
+    out["truncated"] = len(data) > limit
+    out["text"] = data[:limit].decode("utf-8", errors="replace")
+    return out
+
+
 # ---------------------------------------------------------------- PR（gh）
 
 class PRCache:
@@ -183,11 +229,13 @@ class PRCache:
 # ---------------------------------------------------------------- 一覧の組み立て
 
 class Board:
-    def __init__(self, pr_enabled=True, tasks_path=None, recent_done=5, warn=None):
+    def __init__(self, pr_enabled=True, tasks_path=None, recent_done=5, warn=None, results_dir=None):
         self.tracker = logic.SinceTracker()
         self.prs = PRCache(pr_enabled)
         self.lock = threading.Lock()
         self.targets = {}   # 行 id -> herdr focus の対象（名前、無名ならペイン）と tab
+        self.details = {}   # 行 id -> 詳細の材料（名前・最後の応答・表の行）。targets と同じく直近の一覧の分だけ
+        self.results_dir = results_dir
         self._cache = (0.0, None)
         self.tasks = tasklist.TaskFile(tasks_path) if tasks_path else None
         self.recent_done_n = recent_done
@@ -210,14 +258,15 @@ class Board:
         except Exception as ex:  # herdr が動いていないなど
             agents, error = [], str(ex)
         metas = session_metas()
-        rows, targets = [], {}
+        rows, targets, details = [], {}, {}
         for a in agents:
-            rows.append(self._row(a, metas, now, targets))
+            rows.append(self._row(a, metas, now, targets, details))
         self.tracker.forget_except({r["id"] for r in rows})
-        self.targets = targets
         order = {s: i for i, s in enumerate(logic.SECTION_ORDER)}
         # セクション内は、その状態になったのが新しい順
-        warning, recent = self._overlay_tasks(rows)
+        warning, recent = self._overlay_tasks(rows, details)
+        self.targets = targets
+        self.details = details
         rows.sort(key=lambda r: (order[r["section"]], -r["since"]))
         counts = {s: 0 for s in logic.SECTION_ORDER}
         for r in rows:
@@ -225,8 +274,9 @@ class Board:
         return {"now": now, "error": error, "warning": warning, "counts": counts, "rows": rows,
                 "recent_done": recent}
 
-    def _overlay_tasks(self, rows):
-        """--tasks の表を一覧に重ね、(警告, 直近の完了) を返す。"""
+    def _overlay_tasks(self, rows, details=None):
+        """--tasks の表を一覧に重ね、(警告, 直近の完了) を返す。
+        details があれば、各行の詳細に表の行（切る前の全文）を入れる。進行中に無ければ完了の表から探す。"""
         if not self.tasks:
             return None, None
         data = self.tasks.load()
@@ -237,15 +287,24 @@ class Board:
         by_name = {}
         for e in data["active"]:
             by_name.setdefault(e["name"], e)  # 同じ名前が複数あれば上の行
+        done_by_name = {}
+        for e in tasklist.recent_done(data["done"], len(data["done"])):
+            done_by_name.setdefault(e["name"], e)  # 同じ名前が複数あれば終了の新しい方
         for r in rows:
             e = by_name.get(r.get("agent_name")) or by_name.get(r.get("name"))
             if e:
                 logic.overlay_task(r, e, tasklist.needs_you(e.get("status")))
+            if details is not None and r.get("id") in details:
+                if e:
+                    details[r["id"]]["task"] = {"table": "active", **e}
+                else:
+                    d = done_by_name.get(r.get("agent_name")) or done_by_name.get(r.get("name"))
+                    details[r["id"]]["task"] = {"table": "done", **d} if d else None
         recent = [{k: logic.short(e.get(k), 300) for k in ("name", "repo", "ended", "task", "result")}
                   for e in tasklist.recent_done(data["done"], self.recent_done_n)]
         return warning, recent
 
-    def _row(self, a, metas, now, targets):
+    def _row(self, a, metas, now, targets, details=None):
         status = a.get("agent_status") or "unknown"
         sid = (a.get("agent_session") or {}).get("value")
         meta = metas.get(sid) or {}
@@ -264,6 +323,9 @@ class Board:
         name = a.get("name") or meta.get("name") or Path(cwd).name or "?"
         targets[row_id] = {"target": a.get("name") or a.get("pane_id"),
                            "pane": a.get("pane_id"), "tab": a.get("tab_id")}
+        if details is not None:
+            details[row_id] = {"name": name, "file_name": a.get("name") or name,
+                               "last_assistant": summary.get("last_assistant"), "task": None}
         return {
             "id": row_id,
             "name": name,
@@ -280,6 +342,25 @@ class Board:
             "elapsed": logic.fmt_elapsed(now - since),
             "pr": self.prs.get(cwd, summary.get("git_branch"), summary.get("pr_url")),
             "focused": bool(a.get("focused")),
+        }
+
+    def detail(self, row_id):
+        """行 id（直近の一覧にあるものだけ）の詳細。知らない行 id なら None。
+
+        返す dict: id、name、result（結果ファイル。--results-dir も環境変数も無ければ None）、
+        tasks（--tasks を付けたか）、task（表の行。table が "active" か "done"。無ければ None）、
+        last_assistant（最後の応答の全文。会話ログが無ければ None）。
+        """
+        info = self.details.get(row_id)
+        if info is None:
+            return None
+        return {
+            "id": row_id,
+            "name": info["name"],
+            "result": read_result(self.results_dir, info["file_name"]) if self.results_dir else None,
+            "tasks": self.tasks is not None,
+            "task": info["task"],
+            "last_assistant": info["last_assistant"],
         }
 
     def focus(self, row_id):
@@ -341,6 +422,14 @@ def make_handler(board, port):
                 return self._send(200, index.read_bytes(), "text/html; charset=utf-8")
             if self.path == "/api/board":
                 return self._send(200, board.snapshot())
+            url = urlsplit(self.path)
+            if url.path == "/api/detail":
+                # 結果ファイルや会話ログの中身を返すので、他サイトのページから読めないよう独自ヘッダーを要求する
+                if self.headers.get("X-Herdr-Board") != "1":
+                    return self._send(403, {"error": "forbidden"})
+                row_id = (parse_qs(url.query).get("id") or [""])[0]
+                d = board.detail(row_id)
+                return self._send(200, d) if d else self._send(404, {"error": "unknown agent"})
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -371,12 +460,15 @@ def main(argv=None):
     ap.add_argument("--interval", type=float, default=3.0, help="端末版の更新間隔（秒）")
     ap.add_argument("--tasks", metavar="PATH", help="作業の一覧表（Markdown）を重ねて表示する")
     ap.add_argument("--recent-done", type=int, default=5, metavar="N", help="--tasks の完了の表から出す件数")
+    ap.add_argument("--results-dir", metavar="DIR",
+                    help=f"詳細に DIR/<名前>.md を出す（無ければ環境変数 {RESULTS_DIR_ENV}）")
     args = ap.parse_args(argv)
+    results_dir = args.results_dir or os.environ.get(RESULTS_DIR_ENV) or None
     def warn(msg):
         print(f"herdr-board: {msg}", file=sys.stderr)
 
     board = Board(pr_enabled=not args.no_pr, tasks_path=args.tasks, recent_done=max(0, args.recent_done),
-                  warn=None if args.tui else warn)
+                  warn=None if args.tui else warn, results_dir=results_dir)
     if args.tui:
         import tui
         return tui.run(board, max(0.5, args.interval))

@@ -68,15 +68,28 @@
   .toast { position: fixed; bottom: 16px; right: 20px; background: var(--panel); border: 1px solid var(--line);
            padding: 6px 12px; border-radius: 6px; font-size: 12px; opacity: 0; transition: opacity .2s; }
   .toast.on { opacity: 1; }
+  #detail { position: fixed; left: 0; right: 0; bottom: 0; height: 45vh; z-index: 3; display: none;
+            background: var(--panel); border-top: 1px solid var(--line); overflow-y: auto; padding: 10px 20px 24px; }
+  body.detail-open #detail { display: block; }
+  body.detail-open main { padding-bottom: 47vh; }
+  html.detail-open { scroll-padding-bottom: 47vh; }
+  #detail h3 { font: 600 12px var(--mono); letter-spacing: .06em; color: var(--blue); margin: 14px 0 4px; }
+  #detail h3:first-child { margin-top: 0; }
+  #detail .dname { color: var(--fg); }
+  #detail .path { color: var(--dim); font-weight: 400; letter-spacing: 0; margin-left: 8px; }
+  #detail .label { color: var(--dim); font-size: 12px; margin: 6px 0 0; }
+  #detail pre { margin: 2px 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.5 var(--mono); }
+  #detail .none { padding: 2px 0; }
 </style>
 </head>
 <body>
 <header>
   <h1>herdr <span>/</span> board</h1>
   <div class="badges" id="badges"></div>
-  <div class="meta"><span id="updated">—</span><span><kbd>↑</kbd><kbd>↓</kbd> 選択 · <kbd>Enter</kbd> ターミナルで開く</span></div>
+  <div class="meta"><span id="updated">—</span><span><kbd>↑</kbd><kbd>↓</kbd> 選択 · <kbd>Enter</kbd> ターミナルで開く · <kbd>d</kbd> 詳細</span></div>
 </header>
 <main id="main"></main>
+<div id="detail"></div>
 <div class="toast" id="toast"></div>
 <script>
 "use strict";
@@ -214,6 +227,7 @@ function renderRecentDone(main, list) {
 
 function select(id, scroll) {
   selId = id;
+  loadDetail(false);
   for (const e of document.querySelectorAll(".row")) {
     const on = e.dataset.id === id;
     e.classList.toggle("sel", on);
@@ -251,11 +265,93 @@ async function openSel() {
   refresh();
 }
 
+// ---- 詳細（選択中の行の結果ファイル・表の行・最後の応答）。中身は textContent で入れる
+let detailOpen = false;
+let detailId = null;    // 表示中の詳細がどの行 id のものか
+let detailSeq = 0;      // 古い応答で上書きしないための番号
+
+function toggleDetail() {
+  detailOpen = !detailOpen;
+  document.body.classList.toggle("detail-open", detailOpen);
+  document.documentElement.classList.toggle("detail-open", detailOpen);
+  if (detailOpen) loadDetail(true);
+  const s = rows.length && document.querySelector(".row.sel");
+  if (s) s.scrollIntoView({block: "nearest"});
+}
+
+// force でなければ、選択が変わったときだけ読む。選択が変わったら先頭から、同じ行の更新ならスクロール位置を保つ
+async function loadDetail(force) {
+  if (!detailOpen || !selId) return;
+  if (!force && selId === detailId) return;
+  const id = selId, seq = ++detailSeq;
+  let d = null;
+  try {
+    const res = await fetch("/api/detail?id=" + encodeURIComponent(id), {cache: "no-store", headers: {"X-Herdr-Board": "1"}});
+    if (res.ok) d = await res.json();
+  } catch (e) { /* 下で「なし」を出す */ }
+  if (seq !== detailSeq || !detailOpen) return;
+  const box = document.getElementById("detail");
+  const keep = id === detailId ? box.scrollTop : 0;
+  renderDetail(box, d);
+  box.scrollTop = keep;
+  detailId = id;
+}
+
+function renderDetail(box, d) {
+  box.textContent = "";
+  const head = (text, extra) => {
+    const h = el("h3", null, text);
+    if (extra) h.appendChild(el("span", "path", extra));
+    box.appendChild(h);
+  };
+  const none = text => box.appendChild(el("div", "none", text));
+  const pre = text => box.appendChild(el("pre", null, text));
+  if (!d) { none("詳細を取得できませんでした"); return; }
+  const h = el("h3", null, "DETAIL ");
+  h.appendChild(el("span", "dname", d.name || ""));
+  box.appendChild(h);
+  if (d.result) {
+    const r = d.result;
+    head("RESULT FILE", r.path || "");
+    if (r.state === "found") {
+      pre(r.text || "");
+      if (r.truncated) none("（256 KB で切りました。続きはファイルを開いてください）");
+    } else if (r.state === "missing") none("なし（ファイルがありません）");
+    else if (r.state === "refused") none("なし（名前に / か .. を含むか、指定のディレクトリの外なので読みません）");
+    else none("なし（読めません: " + (r.error || "") + "）");
+  }
+  if (d.tasks) {
+    const t = d.task;
+    if (!t) { head("TASK"); none("なし（--tasks の表に同じ名前の行がありません）"); }
+    else {
+      const active = t.table === "active";
+      head(active ? "TASK（進行中）" : "TASK（完了）");
+      const fields = active ? [["依頼内容", "task"], ["状態", "status"], ["結果・メモ", "note"]]
+                            : [["依頼内容", "task"], ["終了", "ended"], ["結果", "result"]];
+      for (const [label, key] of fields) {
+        box.appendChild(el("div", "label", label));
+        pre(t[key] || "-");
+      }
+    }
+  }
+  head("LAST REPLY");
+  if (d.last_assistant) pre(d.last_assistant);
+  else none("なし（会話ログがありません）");
+}
+
 document.addEventListener("keydown", ev => {
   if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
   if (ev.key === "ArrowDown" || ev.key === "j") { move(1); ev.preventDefault(); }
   else if (ev.key === "ArrowUp" || ev.key === "k") { move(-1); ev.preventDefault(); }
   else if (ev.key === "Enter") { openSel(); ev.preventDefault(); }
+  else if (ev.key === "d") { toggleDetail(); ev.preventDefault(); }
+  else if (detailOpen && (ev.key === "J" || ev.key === "K")) {
+    document.getElementById("detail").scrollBy(0, ev.key === "J" ? 40 : -40); ev.preventDefault();
+  }
+  else if (detailOpen && (ev.key === "PageDown" || ev.key === "PageUp")) {
+    const box = document.getElementById("detail");
+    box.scrollBy(0, (ev.key === "PageDown" ? 1 : -1) * box.clientHeight / 2); ev.preventDefault();
+  }
 });
 
 let busy = false;
@@ -265,6 +361,7 @@ async function refresh() {
   try {
     const res = await fetch("/api/board", {cache: "no-store"});
     render(await res.json());
+    loadDetail(true);
   } catch (e) {
     document.getElementById("updated").textContent = "サーバーに接続できません";
   } finally { busy = false; }
